@@ -78,9 +78,10 @@ app.get('/app', (req, res) => {
   `);
 });
 
-// Handle form submission
+// Handle form submission (also used by Airtable automation)
 app.post('/generate-batch', async (req, res) => {
-  const { prompt, subjectUrl, refUrls, width, height, batchCount } = req.body;
+  // NEW: allow parentId to be passed (from Airtable button/automation)
+  const { prompt, subjectUrl, refUrls, width, height, batchCount, parentId: incomingParentId } = req.body;
 
   if (!prompt || !subjectUrl || !width || !height || !batchCount) {
     res.status(400).send('All fields required. Hit Back and try again.');
@@ -90,14 +91,14 @@ app.post('/generate-batch', async (req, res) => {
   try {
     // Convert images to base64 data URLs
     const subjectDataUrl = await urlToDataURL(subjectUrl.trim());
-    const refs = refUrls
-      ? refUrls.split(',').map(s => s.trim()).filter(Boolean)
-      : [];
+    const refs = (refUrls ? refUrls.split(',') : []).map(s => s.trim()).filter(Boolean);
     const refDataUrls = await Promise.all(refs.map(urlToDataURL));
     const allImages = [subjectDataUrl, ...refDataUrls];
 
-    // Prepare Airtable row
-    const fields = {
+    const tableId = AIRTABLE_TABLE;
+
+    // Prepare canonical fields (used for either update or create)
+    const canonicalFields = {
       Prompt: prompt,
       Subject: [{ url: subjectUrl }],
       References: refs.map(u => ({ url: u })),
@@ -115,16 +116,23 @@ app.post('/generate-batch', async (req, res) => {
       'Completed At': '',
     };
 
-    // Create Airtable parent row
-    const tableId = AIRTABLE_TABLE;
-    const createRowRes = await airtableApi(`${tableId}`, {
-      method: 'POST',
-      body: JSON.stringify({ records: [{ fields }] }),
-    });
-    const parentId = createRowRes.records[0].id;
+    // NEW: if parentId provided, update existing row; else create a new one
+    let parentId = incomingParentId && String(incomingParentId).trim();
+    if (parentId) {
+      await airtableApi(`${tableId}/${parentId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ fields: canonicalFields }),
+      });
+    } else {
+      const createRowRes = await airtableApi(`${tableId}`, {
+        method: 'POST',
+        body: JSON.stringify({ records: [{ fields: canonicalFields }] }),
+      });
+      parentId = createRowRes.records[0].id;
+    }
 
     // For each batch, submit job and save request IDs
-    let requestIds = [];
+    const ids = [];
     for (let i = 0; i < Number(batchCount); i++) {
       await new Promise(r => setTimeout(r, 1200)); // spacing jobs
       const reqId = await withRetries(async () => {
@@ -137,7 +145,7 @@ app.post('/generate-batch', async (req, res) => {
           },
           body: JSON.stringify({
             prompt,
-            images: allImages,
+            images: allImages,               // subject first, then refs
             width: Number(width),
             height: Number(height),
             webhook: `${PUBLIC_BASE_URL || req.protocol + '://' + req.get('host')}/webhooks/wavespeed`,
@@ -147,25 +155,23 @@ app.post('/generate-batch', async (req, res) => {
         const data = await resp.json();
         return data.request_id;
       });
-      requestIds.push(reqId);
+      ids.push(reqId);
     }
 
     // Update Airtable row with request IDs
     await airtableApi(`${tableId}/${parentId}`, {
       method: 'PATCH',
-      body: JSON.stringify({ fields: { 'Request IDs': requestIds.join(',') } }),
+      body: JSON.stringify({ fields: { 'Request IDs': ids.join(',') } }),
     });
 
     // Start pollers for each job
-    for (const reqId of requestIds) {
+    for (const reqId of ids) {
       pollUntilDone(reqId, parentId).catch(e =>
         console.error('Poller error', reqId, e)
       );
     }
 
-    res.send(
-      `Batch started! Parent Airtable row created. <a href="/app">Start another</a>`
-    );
+    res.send(`Batch started! Parent Airtable row: ${parentId}. <a href="/app">Start another</a>`);
   } catch (e) {
     console.error(e);
     res.status(500).send('Error: ' + e.message);
@@ -188,9 +194,7 @@ async function pollUntilDone(requestId, parentId) {
       const data = await resp.json();
       if (['completed', 'failed'].includes(data.status)) {
         // Append output
-        const outputAttachment = data.output_url
-          ? [{ url: data.output_url }]
-          : [];
+        const outputAttachment = data.output_url ? [{ url: data.output_url }] : [];
         // Fetch current Airtable row
         const record = await airtableApi(`${tableId}/${parentId}`);
         const fields = record.fields;
@@ -199,8 +203,7 @@ async function pollUntilDone(requestId, parentId) {
         // Output
         const output = fields.Output || [];
         if (outputAttachment.length) output.push(...outputAttachment);
-        const failed = fields['Failed IDs'] || '';
-        const failedIds = (failed || '').split(',').filter(Boolean);
+        const failedIds = (fields['Failed IDs'] || '').split(',').filter(Boolean);
         if (data.status === 'failed') failedIds.push(requestId);
         // If all Request IDs seen, mark completed
         const allReqIds = (fields['Request IDs'] || '').split(',').filter(Boolean);
@@ -251,29 +254,33 @@ async function pollUntilDone(requestId, parentId) {
 
 // Webhook receiver
 app.post('/webhooks/wavespeed', async (req, res) => {
-  // Parse webhook payload
   try {
     const { request_id, output_url, status } = req.body;
-    // Find Airtable parent row by request_id (search in 'Request IDs')
-    // NOTE: For more efficient lookups, store requestId->parentId mapping in a cache/db in a real app.
+
     const tableId = AIRTABLE_TABLE;
-    const rows = await airtableApi(`${tableId}?filterByFormula=FIND('${request_id}', {Request IDs})`);
+    // Safer: URL-encode the filterByFormula
+    const formula = encodeURIComponent(`FIND('${request_id}', {Request IDs})`);
+    const rows = await airtableApi(`${tableId}?filterByFormula=${formula}`);
     if (rows.records.length === 0) {
       res.status(404).send('Parent row not found');
       return;
     }
     const parentId = rows.records[0].id;
+
     // Update Airtable row
     const fields = rows.records[0].fields;
     const seen = (fields['Seen IDs'] || '').split(',').filter(Boolean);
     if (!seen.includes(request_id)) seen.push(request_id);
+
     const output = fields.Output || [];
     if (output_url) output.push({ url: output_url });
+
     const failedIds = (fields['Failed IDs'] || '').split(',').filter(Boolean);
     if (status === 'failed') failedIds.push(request_id);
-    // If all Request IDs seen, mark completed
+
     const allReqIds = (fields['Request IDs'] || '').split(',').filter(Boolean);
     const isDone = seen.length === allReqIds.length;
+
     await airtableApi(`${tableId}/${parentId}`, {
       method: 'PATCH',
       body: JSON.stringify({
@@ -291,6 +298,7 @@ app.post('/webhooks/wavespeed', async (req, res) => {
         },
       }),
     });
+
     res.send('OK');
   } catch (e) {
     console.error('Webhook error:', e);
