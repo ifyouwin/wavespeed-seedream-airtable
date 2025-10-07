@@ -1,5 +1,5 @@
 {
-  "name": "wavespeed-seedream-airtable",
+  "name": "seedreamv4-airtable",
   "version": "1.0.0",
   "type": "module",
   "main": "server.mjs",
